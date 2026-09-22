@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 def _valid_percentages(value: List[int]) -> List[int]:
@@ -16,6 +16,22 @@ def _valid_percentages(value: List[int]) -> List[int]:
     if value[-1] != 100:
         raise ValueError("the final rollout stage must be 100")
     return [int(p) for p in value]
+
+
+def _normalize_tenants(value: Optional[List[str]]) -> Optional[List[str]]:
+    """Trim entries, drop blanks, enforce length, and de-duplicate in order."""
+    if value is None:
+        return None
+    normalized: List[str] = []
+    for raw in value:
+        tenant = (raw or "").strip()
+        if not tenant:
+            continue
+        if len(tenant) > 128:
+            raise ValueError("tenant id must be at most 128 characters")
+        if tenant not in normalized:
+            normalized.append(tenant)
+    return normalized
 
 
 class ServiceRegister(BaseModel):
@@ -44,11 +60,40 @@ class ReleaseCreate(BaseModel):
         default=None,
         description="Per-release ascending stages; defaults to the service's default_rollout.",
     )
+    tenant_allowlist: Optional[List[str]] = Field(
+        default=None,
+        max_length=1000,
+        description="Tenants that always receive this canary, bypassing the percentage split. "
+                    "Optional; empty/unset means the list is not used.",
+    )
+    tenant_denylist: Optional[List[str]] = Field(
+        default=None,
+        max_length=1000,
+        description="Tenants that never receive this canary and always stay on stable. "
+                    "Takes precedence over the allowlist and the percentage split.",
+    )
 
     @field_validator("rollout")
     @classmethod
     def check_rollout(cls, v):
         return None if v is None else _valid_percentages(v)
+
+    @field_validator("tenant_allowlist", "tenant_denylist")
+    @classmethod
+    def check_tenants(cls, v):
+        return _normalize_tenants(v)
+
+    @model_validator(mode="after")
+    def check_tenant_list_conflict(self):
+        allow = set(self.tenant_allowlist or [])
+        deny = set(self.tenant_denylist or [])
+        overlap = sorted(allow & deny)
+        if overlap:
+            raise ValueError(
+                "tenant_allowlist and tenant_denylist must not contain the same tenant(s): "
+                + ", ".join(overlap)
+            )
+        return self
 
 
 class PromoteRequest(BaseModel):

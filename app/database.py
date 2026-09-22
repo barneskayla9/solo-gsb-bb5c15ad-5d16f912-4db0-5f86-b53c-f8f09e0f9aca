@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 
 DB_PATH = os.getenv("CANARY_DB_PATH", str(Path(__file__).resolve().parent.parent / "data" / "canary.db"))
@@ -30,6 +31,8 @@ CREATE TABLE IF NOT EXISTS releases (
     min_requests             INTEGER NOT NULL DEFAULT 10,
     status                   TEXT NOT NULL DEFAULT 'progressing'
         CHECK (status IN ('progressing', 'paused', 'complete', 'rolled_back')),
+    tenant_allowlist         TEXT NOT NULL DEFAULT '[]',
+    tenant_denylist          TEXT NOT NULL DEFAULT '[]',
     created_at               TEXT NOT NULL,
     updated_at               TEXT NOT NULL,
     UNIQUE (service_name, version)
@@ -58,7 +61,55 @@ CREATE TABLE IF NOT EXISTS audit_log (
     created_at   TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_audit_service_time ON audit_log(service_name, created_at);
+
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version    INTEGER PRIMARY KEY,
+    applied_at TEXT NOT NULL
+);
 """
+
+# --------------------------------------------------------------------------- #
+# Migrations for databases created by earlier versions.
+# Each migration is idempotent via _column_exists, so it is also safe to run
+# against a freshly-created schema that already includes the columns.
+# --------------------------------------------------------------------------- #
+MIGRATIONS = [
+    # version 1: tenant-targeted rollout lists on releases
+    (
+        1,
+        [
+            "ALTER TABLE releases ADD COLUMN tenant_allowlist TEXT NOT NULL DEFAULT '[]'",
+            "ALTER TABLE releases ADD COLUMN tenant_denylist TEXT NOT NULL DEFAULT '[]'",
+        ],
+    ),
+]
+
+
+def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return any(r["name"] == column for r in rows)
+
+
+def _run_migrations(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS schema_migrations ("
+        "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+    )
+    applied = {r["version"] for r in conn.execute("SELECT version FROM schema_migrations").fetchall()}
+    for version, statements in MIGRATIONS:
+        if version in applied:
+            continue
+        for stmt in statements:
+            # ALTER TABLE ADD COLUMN has no IF NOT EXISTS in SQLite; guard manually.
+            head, _, _ = stmt.partition(" ADD COLUMN ")
+            table = head.split()[-1]
+            column = stmt.split("ADD COLUMN", 1)[1].split()[0]
+            if not _column_exists(conn, table, column):
+                conn.execute(stmt)
+        conn.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+            (version, datetime.now(timezone.utc).isoformat(timespec="seconds")),
+        )
 
 
 def _connect() -> sqlite3.Connection:
@@ -75,6 +126,7 @@ def init_db() -> None:
     conn = _connect()
     try:
         conn.executescript(SCHEMA)
+        _run_migrations(conn)
         conn.commit()
     finally:
         conn.close()

@@ -152,53 +152,105 @@ def evaluate_gate(db: sqlite3.Connection, release: sqlite3.Row) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# Tenant targeting
+# --------------------------------------------------------------------------- #
+def _tenant_list(release: sqlite3.Row, column: str) -> list:
+    raw = release[column] if column in release.keys() else None
+    if not raw:
+        return []
+    try:
+        value = json.loads(raw)
+    except (ValueError, TypeError):
+        return []
+    return value if isinstance(value, list) else []
+
+
+def resolve_tenant_rule(release: sqlite3.Row, tenant_id: str) -> Optional[str]:
+    """Evaluate tenant lists for a canary.
+
+    Priority: denylist -> allowlist -> None (fall through to hash percentage).
+    Returns the matched rule name, or None when no list matches / applies.
+    """
+    if tenant_id in _tenant_list(release, "tenant_denylist"):
+        return "denylist"
+    if tenant_id in _tenant_list(release, "tenant_allowlist"):
+        return "allowlist"
+    return None
+
+
+# --------------------------------------------------------------------------- #
 # Routing decision
 # --------------------------------------------------------------------------- #
-def route_request(db: sqlite3.Connection, service_name: str, user_id: str) -> dict:
+def route_request(db: sqlite3.Connection, service_name: str, user_id: str,
+                  tenant_id: Optional[str] = None) -> dict:
     canary = get_progressing_or_paused(db, service_name)
     stable = get_stable_release(db, service_name)
+    bucket = cohort_bucket(service_name, user_id)
 
-    # A 100% canary is effectively the active version until it is marked complete.
-    if canary is not None and canary["percentage"] >= 100 and canary["status"] != "paused":
-        return _route_hit(canary, user_id, 100, stable, stable is not None)
-
-    if canary is not None and canary["status"] == "progressing":
-        bucket = cohort_bucket(service_name, user_id)
-        if bucket < canary["percentage"]:
-            return _route_hit(canary, user_id, bucket, stable, True)
-        if stable is not None:
-            return {
-                "service": service_name, "user_id": user_id, "bucket": bucket,
-                "cohort": "stable", "version": stable["version"], "release_id": stable["id"],
-                "canary_version": canary["version"], "canary_percentage": canary["percentage"],
-            }
-        # No stable version yet: everyone outside the cohort has nothing.
+    def stable_fallback(rule: str) -> dict:
         return {
-            "service": service_name, "user_id": user_id, "bucket": bucket,
+            "service": service_name, "user_id": user_id, "tenant_id": tenant_id, "bucket": bucket,
+            "cohort": "stable", "version": stable["version"], "release_id": stable["id"],
+            "canary_version": canary["version"], "canary_percentage": canary["percentage"],
+            "matched_rule": rule,
+        }
+
+    def no_version(rule: str) -> dict:
+        return {
+            "service": service_name, "user_id": user_id, "tenant_id": tenant_id, "bucket": bucket,
             "cohort": "none", "version": None, "release_id": None,
             "canary_version": canary["version"], "canary_percentage": canary["percentage"],
+            "matched_rule": rule,
         }
 
-    if stable is not None:
+    def stable_only() -> dict:
         return {
-            "service": service_name, "user_id": user_id, "bucket": cohort_bucket(service_name, user_id),
+            "service": service_name, "user_id": user_id, "tenant_id": tenant_id,
+            "bucket": cohort_bucket(service_name, user_id),
             "cohort": "stable", "version": stable["version"], "release_id": stable["id"],
-            "canary_version": None, "canary_percentage": None,
+            "canary_version": None, "canary_percentage": None, "matched_rule": None,
         }
 
-    return {
-        "service": service_name, "user_id": user_id,
-        "bucket": cohort_bucket(service_name, user_id),
-        "cohort": "none", "version": None, "release_id": None,
-        "canary_version": None, "canary_percentage": None,
-    }
+    if canary is None:
+        if stable is not None:
+            return stable_only()
+        return {
+            "service": service_name, "user_id": user_id, "tenant_id": tenant_id,
+            "bucket": cohort_bucket(service_name, user_id),
+            "cohort": "none", "version": None, "release_id": None,
+            "canary_version": None, "canary_percentage": None, "matched_rule": None,
+        }
+
+    # Paused canary serves nobody; tenant lists never override the pause.
+    if canary["status"] == "paused":
+        return stable_fallback("paused") if stable is not None else no_version("paused")
+
+    # A 100% canary is effectively the active version until it is marked complete.
+    if canary["percentage"] >= 100:
+        rule = resolve_tenant_rule(canary, tenant_id) if tenant_id else None
+        if rule == "denylist":
+            return stable_fallback(rule) if stable is not None else no_version(rule)
+        return _route_hit(canary, user_id, 100, stable, stable is not None, tenant_id,
+                          rule or "percentage")
+
+    # Progressing canary: denylist -> allowlist -> stable-hash percentage.
+    rule = resolve_tenant_rule(canary, tenant_id) if tenant_id else None
+    if rule == "denylist":
+        return stable_fallback(rule) if stable is not None else no_version(rule)
+    if rule == "allowlist" or bucket < canary["percentage"]:
+        return _route_hit(canary, user_id, bucket, stable, True, tenant_id,
+                          rule or "percentage")
+    return stable_fallback("percentage") if stable is not None else no_version("percentage")
 
 
 def _route_hit(canary: sqlite3.Row, user_id: str, bucket: int,
-               stable: Optional[sqlite3.Row], has_fallback: bool) -> dict:
+               stable: Optional[sqlite3.Row], has_fallback: bool,
+               tenant_id: Optional[str] = None, matched_rule: str = "percentage") -> dict:
     return {
-        "service": canary["service_name"], "user_id": user_id, "bucket": bucket,
+        "service": canary["service_name"], "user_id": user_id, "tenant_id": tenant_id,
+        "bucket": bucket,
         "cohort": "canary", "version": canary["version"], "release_id": canary["id"],
         "canary_version": canary["version"], "canary_percentage": canary["percentage"],
         "fallback_version": stable["version"] if has_fallback else None,
+        "matched_rule": matched_rule,
     }

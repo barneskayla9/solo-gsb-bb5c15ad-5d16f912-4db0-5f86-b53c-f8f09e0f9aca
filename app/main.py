@@ -4,7 +4,8 @@ Endpoints
 ---------
 POST   /services/{name}/releases                       create/publish a release
 GET    /services/{name}/releases                       list releases
-GET    /services/{name}/route?user_id=...              resolve which version serves a user
+GET    /services/{name}/route?user_id=...&tenant_id=...   resolve which version serves a user
+       (tenant routing priority: denylist -> allowlist -> stable-hash percentage)
 POST   /services/{name}/releases/{id}/promote          advance rollout percentage
 POST   /services/{name}/releases/{id}/pause            manual pause
 POST   /services/{name}/releases/{id}/resume           resume a paused release
@@ -90,6 +91,8 @@ def release_dict(row) -> dict:
         "error_threshold": row["error_threshold"],
         "window_seconds": row["window_seconds"],
         "min_requests": row["min_requests"],
+        "tenant_allowlist": json.loads(row["tenant_allowlist"] or "[]"),
+        "tenant_denylist": json.loads(row["tenant_denylist"] or "[]"),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
@@ -150,24 +153,29 @@ def create_release(service_name: str, payload: ReleaseCreate, db: Connection = D
         )
 
     ts = now_iso()
+    allowlist = payload.tenant_allowlist or []
+    denylist = payload.tenant_denylist or []
     first_release = get_stable_release(db, service_name) is None
     if first_release:
         # The first release is the known-good baseline and serves 100% immediately.
         db.execute(
             "INSERT INTO releases (service_name, version, percentage, stages, stage_index, "
-            "error_threshold, window_seconds, min_requests, status, created_at, updated_at) "
-            "VALUES (?, ?, 100, '[100]', 0, ?, ?, ?, 'complete', ?, ?)",
+            "error_threshold, window_seconds, min_requests, status, "
+            "tenant_allowlist, tenant_denylist, created_at, updated_at) "
+            "VALUES (?, ?, 100, '[100]', 0, ?, ?, ?, 'complete', ?, ?, ?, ?)",
             (service_name, payload.version, payload.error_threshold, payload.window_seconds,
-             payload.min_requests, ts, ts),
+             payload.min_requests, json.dumps(allowlist), json.dumps(denylist), ts, ts),
         )
         action, percentage = "release_baseline", 100
     else:
         db.execute(
             "INSERT INTO releases (service_name, version, percentage, stages, stage_index, "
-            "error_threshold, window_seconds, min_requests, status, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, 0, ?, ?, ?, 'progressing', ?, ?)",
+            "error_threshold, window_seconds, min_requests, status, "
+            "tenant_allowlist, tenant_denylist, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, 0, ?, ?, ?, 'progressing', ?, ?, ?, ?)",
             (service_name, payload.version, stages[0], json.dumps(stages),
-             payload.error_threshold, payload.window_seconds, payload.min_requests, ts, ts),
+             payload.error_threshold, payload.window_seconds, payload.min_requests,
+             json.dumps(allowlist), json.dumps(denylist), ts, ts),
         )
         action, percentage = "release_created", stages[0]
 
@@ -178,7 +186,8 @@ def create_release(service_name: str, payload: ReleaseCreate, db: Connection = D
     write_audit(db, service_name, action,
                 {"version": payload.version, "percentage": percentage, "stages": stages,
                  "error_threshold": payload.error_threshold, "window_seconds": payload.window_seconds,
-                 "min_requests": payload.min_requests},
+                 "min_requests": payload.min_requests,
+                 "tenant_allowlist": allowlist, "tenant_denylist": denylist},
                 version=payload.version)
     return release_dict(row)
 
@@ -196,10 +205,23 @@ def list_releases(service_name: str, db: Connection = Depends(get_db)):
 def resolve_route(
     service_name: str,
     user_id: str = Query(..., min_length=1, description="Stable user identifier (id, account, hash)."),
+    tenant_id: Optional[str] = Query(
+        default=None,
+        min_length=1,
+        max_length=128,
+        description="Tenant identifier for allowlist/denylist targeting. "
+                    "When omitted, routing uses the stable-hash percentage split only.",
+    ),
     db: Connection = Depends(get_db),
 ):
     require_service(db, service_name)
-    result = route_request(db, service_name, user_id)
+    result = route_request(db, service_name, user_id, tenant_id)
+    write_audit(db, service_name, "route_resolved",
+                {"user_id": user_id, "tenant_id": tenant_id, "cohort": result["cohort"],
+                 "version": result["version"], "release_id": result["release_id"],
+                 "bucket": result["bucket"], "matched_rule": result.get("matched_rule"),
+                 "canary_version": result.get("canary_version"),
+                 "canary_percentage": result.get("canary_percentage")})
     if result["cohort"] == "none":
         return JSONResponse(
             status_code=503,
