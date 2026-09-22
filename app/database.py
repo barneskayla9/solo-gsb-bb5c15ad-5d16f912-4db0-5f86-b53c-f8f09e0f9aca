@@ -28,6 +28,8 @@ CREATE TABLE IF NOT EXISTS releases (
     error_threshold          REAL NOT NULL DEFAULT 0.1,
     window_seconds           INTEGER NOT NULL DEFAULT 300,
     min_requests             INTEGER NOT NULL DEFAULT 10,
+    tenant_allowlist         TEXT NOT NULL DEFAULT '[]',
+    tenant_denylist          TEXT NOT NULL DEFAULT '[]',
     status                   TEXT NOT NULL DEFAULT 'progressing'
         CHECK (status IN ('progressing', 'paused', 'complete', 'rolled_back')),
     created_at               TEXT NOT NULL,
@@ -60,6 +62,17 @@ CREATE TABLE IF NOT EXISTS audit_log (
 CREATE INDEX IF NOT EXISTS idx_audit_service_time ON audit_log(service_name, created_at);
 """
 
+# Idempotent migrations for databases created by older versions.
+# Each entry is (table, column, DDL fragment applied when the column is missing).
+# The current SCHEMA already contains every column, so fresh databases need none
+# of these; they only upgrade pre-existing databases in place.
+MIGRATIONS = [
+    ("releases", "tenant_allowlist",
+     "ALTER TABLE releases ADD COLUMN tenant_allowlist TEXT NOT NULL DEFAULT '[]'"),
+    ("releases", "tenant_denylist",
+     "ALTER TABLE releases ADD COLUMN tenant_denylist TEXT NOT NULL DEFAULT '[]'"),
+]
+
 
 def _connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, timeout=10, check_same_thread=False)
@@ -70,11 +83,24 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _run_migrations(conn: sqlite3.Connection) -> None:
+    """Add columns introduced after the database was first created."""
+    for table, column, ddl in MIGRATIONS:
+        existing = _table_columns(conn, table)
+        if existing and column not in existing:
+            conn.execute(ddl)
+
+
 def init_db() -> None:
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     conn = _connect()
     try:
         conn.executescript(SCHEMA)
+        _run_migrations(conn)
         conn.commit()
     finally:
         conn.close()

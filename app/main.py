@@ -4,7 +4,7 @@ Endpoints
 ---------
 POST   /services/{name}/releases                       create/publish a release
 GET    /services/{name}/releases                       list releases
-GET    /services/{name}/route?user_id=...              resolve which version serves a user
+GET    /services/{name}/route?user_id=...&tenant_id=.. resolve which version serves a user
 POST   /services/{name}/releases/{id}/promote          advance rollout percentage
 POST   /services/{name}/releases/{id}/pause            manual pause
 POST   /services/{name}/releases/{id}/resume           resume a paused release
@@ -14,6 +14,12 @@ POST   /services/{name}/releases/{id}/telemetry        report one request result
 POST   /services/{name}/telemetry                      batch report request results
 GET    /services/{name}/status                         gate status + window error rate
 GET    /services/{name}/audit                          audit trail
+
+Releases may carry a ``tenant_allowlist`` and ``tenant_denylist``. When a
+``/route`` request identifies a ``tenant_id`` the decision follows the
+precedence denylist -> allowlist -> stable-hash percentage; the matched rule
+is returned and recorded in the audit log. Requests without ``tenant_id``
+keep the original hash-only behavior.
 """
 from __future__ import annotations
 
@@ -90,6 +96,8 @@ def release_dict(row) -> dict:
         "error_threshold": row["error_threshold"],
         "window_seconds": row["window_seconds"],
         "min_requests": row["min_requests"],
+        "tenant_allowlist": json.loads(row["tenant_allowlist"]),
+        "tenant_denylist": json.loads(row["tenant_denylist"]),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
@@ -150,24 +158,29 @@ def create_release(service_name: str, payload: ReleaseCreate, db: Connection = D
         )
 
     ts = now_iso()
+    allowlist_json = json.dumps(payload.tenant_allowlist, ensure_ascii=False)
+    denylist_json = json.dumps(payload.tenant_denylist, ensure_ascii=False)
     first_release = get_stable_release(db, service_name) is None
     if first_release:
         # The first release is the known-good baseline and serves 100% immediately.
         db.execute(
             "INSERT INTO releases (service_name, version, percentage, stages, stage_index, "
-            "error_threshold, window_seconds, min_requests, status, created_at, updated_at) "
-            "VALUES (?, ?, 100, '[100]', 0, ?, ?, ?, 'complete', ?, ?)",
+            "error_threshold, window_seconds, min_requests, tenant_allowlist, tenant_denylist, "
+            "status, created_at, updated_at) "
+            "VALUES (?, ?, 100, '[100]', 0, ?, ?, ?, ?, ?, 'complete', ?, ?)",
             (service_name, payload.version, payload.error_threshold, payload.window_seconds,
-             payload.min_requests, ts, ts),
+             payload.min_requests, allowlist_json, denylist_json, ts, ts),
         )
         action, percentage = "release_baseline", 100
     else:
         db.execute(
             "INSERT INTO releases (service_name, version, percentage, stages, stage_index, "
-            "error_threshold, window_seconds, min_requests, status, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, 0, ?, ?, ?, 'progressing', ?, ?)",
+            "error_threshold, window_seconds, min_requests, tenant_allowlist, tenant_denylist, "
+            "status, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, 'progressing', ?, ?)",
             (service_name, payload.version, stages[0], json.dumps(stages),
-             payload.error_threshold, payload.window_seconds, payload.min_requests, ts, ts),
+             payload.error_threshold, payload.window_seconds, payload.min_requests,
+             allowlist_json, denylist_json, ts, ts),
         )
         action, percentage = "release_created", stages[0]
 
@@ -178,7 +191,9 @@ def create_release(service_name: str, payload: ReleaseCreate, db: Connection = D
     write_audit(db, service_name, action,
                 {"version": payload.version, "percentage": percentage, "stages": stages,
                  "error_threshold": payload.error_threshold, "window_seconds": payload.window_seconds,
-                 "min_requests": payload.min_requests},
+                 "min_requests": payload.min_requests,
+                 "tenant_allowlist": payload.tenant_allowlist,
+                 "tenant_denylist": payload.tenant_denylist},
                 version=payload.version)
     return release_dict(row)
 
@@ -196,10 +211,33 @@ def list_releases(service_name: str, db: Connection = Depends(get_db)):
 def resolve_route(
     service_name: str,
     user_id: str = Query(..., min_length=1, description="Stable user identifier (id, account, hash)."),
+    tenant_id: Optional[str] = Query(
+        default=None,
+        min_length=1,
+        max_length=128,
+        description="Tenant identifier for targeted rollout. When provided, the decision "
+                    "follows denylist -> allowlist -> stable-hash percentage and the matched "
+                    "rule is returned; when omitted, routing behaves as before (hash only).",
+    ),
     db: Connection = Depends(get_db),
 ):
     require_service(db, service_name)
-    result = route_request(db, service_name, user_id)
+    result = route_request(db, service_name, user_id, tenant_id)
+    if tenant_id is not None:
+        # Record the tenant-targeting decision; omit the stable bucket to keep
+        # the audit row focused on which rule fired.
+        audit_detail = {
+            "user_id": user_id,
+            "tenant_id": tenant_id,
+            "cohort": result["cohort"],
+            "version": result["version"],
+            "release_id": result["release_id"],
+            "rule": result.get("rule"),
+            "canary_version": result.get("canary_version"),
+            "canary_percentage": result.get("canary_percentage"),
+        }
+        write_audit(db, service_name, "route_checked", audit_detail,
+                    version=result["version"] or result.get("canary_version"))
     if result["cohort"] == "none":
         return JSONResponse(
             status_code=503,
